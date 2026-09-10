@@ -70,10 +70,86 @@ def build_scene(config: AirportMapConfig | None = None) -> object:
     return scene
 
 
+def render_mitsuba_map(
+    config: AirportMapConfig | None = None,
+    output_path: str | Path = "airport_map_mitsuba.png",
+    resolution: int = 512,
+) -> Path:
+    """Render the airport topology with Mitsuba's path tracer."""
+
+    if resolution < 16:
+        raise ValueError("resolution must be at least 16")
+    try:
+        import mitsuba as mi
+    except ImportError as exc:
+        raise RuntimeError("Mitsuba is required for map rendering") from exc
+
+    mi.set_variant("llvm_ad_rgb")
+    cfg = config or AirportMapConfig()
+    hx, hy = cfg.hangar_size
+    gx, gy = cfg.gate_size
+
+    def shape(center: tuple[float, float, float],
+              size: tuple[float, float, float],
+              color: tuple[float, float, float]) -> dict:
+        return {
+            "type": "cube",
+            "to_world": mi.ScalarTransform4f.translate(center).scale(size),
+            "bsdf": {
+                "type": "diffuse",
+                "reflectance": {"type": "rgb", "value": color},
+            },
+        }
+
+    shapes: dict[str, dict] = {
+        "hangar_north": shape(
+            (cfg.hangar_center[0], cfg.hangar_center[1] + hy / 2, cfg.wall_height / 2),
+            (hx, 0.5, cfg.wall_height), (0.35, 0.45, 0.60),
+        ),
+        "hangar_south": shape(
+            (cfg.hangar_center[0], cfg.hangar_center[1] - hy / 2, cfg.wall_height / 2),
+            (hx, 0.5, cfg.wall_height), (0.35, 0.45, 0.60),
+        ),
+        "hangar_east": shape(
+            (cfg.hangar_center[0] + hx / 2, cfg.hangar_center[1], cfg.wall_height / 2),
+            (0.5, hy, cfg.wall_height), (0.35, 0.45, 0.60),
+        ),
+        "gate_terminal": shape(
+            (cfg.gate_center[0], cfg.gate_center[1], cfg.wall_height / 2),
+            (gx, gy, cfg.wall_height), (0.80, 0.55, 0.20),
+        ),
+        "ground": shape((10.0, 5.0, -0.25), (180.0, 150.0, 0.5), (0.12, 0.15, 0.18)),
+    }
+    scene = mi.load_dict({
+        "type": "scene",
+        "integrator": {"type": "path", "max_depth": 4},
+        "sensor": {
+            "type": "perspective",
+            "to_world": mi.ScalarTransform4f.look_at(
+                origin=(20.0, -105.0, 100.0),
+                target=(15.0, 8.0, 0.0),
+                up=(0.0, 0.0, 1.0),
+            ),
+            "fov": 55.0,
+            "film": {
+                "type": "hdrfilm",
+                "width": resolution,
+                "height": int(resolution * 0.7),
+                "pixel_format": "rgb",
+            },
+            "sampler": {"type": "independent", "sample_count": 16},
+        },
+        **shapes,
+    })
+    image = mi.render(scene, spp=16)
+    destination = Path(output_path).resolve()
+    mi.util.write_bitmap(str(destination), image)
+    return destination
+
+
 def plot_map(
     tracks: Iterable[TrackEstimate] = (),
     config: AirportMapConfig | None = None,
-    output_path: str | Path | None = None,
 ):
     """Visualize topology, gNodeBs, and reconstructed aircraft coordinates."""
 
@@ -109,6 +185,49 @@ def plot_map(
     unique = dict(zip(labels, handles))
     axis.legend(unique.values(), unique.keys())
     figure.tight_layout()
-    if output_path is not None:
-        figure.savefig(output_path, dpi=150)
     return figure, axis
+
+
+def plot_signals(
+    tracks: Iterable[TrackEstimate],
+    figure=None,
+    output_path: str | Path | None = None,
+):
+    """Display and optionally save reconstructed RF-sensing signals."""
+
+    import matplotlib.pyplot as plt
+
+    points = list(tracks)
+    if figure is None:
+        figure, axes = plt.subplots(2, 2, figsize=(11, 7), num="Asterion-5G signals")
+        axes = axes.ravel()
+    else:
+        axes = list(figure.axes)
+        if len(axes) != 4:
+            figure.clear()
+            axes = figure.subplots(2, 2).ravel()
+
+    for axis in axes:
+        axis.clear()
+        axis.grid(True, alpha=0.25)
+
+    if points:
+        samples = np.arange(len(points))
+        axes[0].plot(samples, [point.range_m for point in points], "o-", color="tab:blue")
+        axes[1].plot(samples, [point.speed for point in points], "o-", color="tab:orange")
+        axes[2].plot([point.x for point in points], [point.y for point in points],
+                     "o-", color="tab:red")
+        axes[3].plot(samples, np.rad2deg([point.azimuth_rad for point in points]),
+                     "o-", color="tab:green")
+
+    axes[0].set(title="ToA / range", xlabel="Sample", ylabel="Range [m]")
+    axes[1].set(title="Doppler / speed", xlabel="Sample", ylabel="Speed [m/s]")
+    axes[2].set(title="Reconstructed trajectory", xlabel="X [m]", ylabel="Y [m]")
+    axes[3].set(title="AoA / azimuth", xlabel="Sample", ylabel="Angle [deg]")
+    axes[2].set_aspect("equal", adjustable="datalim")
+    figure.tight_layout()
+    figure.canvas.draw_idle()
+    figure.canvas.flush_events()
+    if output_path is not None:
+        figure.savefig(output_path, format="png", dpi=150)
+    return figure

@@ -1,171 +1,244 @@
+"""gNodeB endpoint for the 5G RF-sensing pipeline.
+
+The class owns the channel and DSP state.  Keeping this state in one endpoint
+also makes it possible to use several independent gNodeBs in a relay setup.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Callable, Iterable, Protocol
+
 import numpy as np
-import tensorflow as tf
-from sionna.phy import config
-from sionna.phy.ofdm import (
-    ResourceGrid,
-    ResourceGridMapper,
-    ResourceGridDemapper,
-    OFDMModulator,
-    OFDMDemodulator,
-    LSChannelEstimator,
-)
-from sionna.phy.mimo import StreamManagement, LMMSEEqualizer
-from sionna.phy.mapping import Mapper, Demapper, QAMSource
-from sionna.phy.fec.ldpc import LDPC5GEncoder, LDPC5GDecoder
-from sionna.phy.utils import ebnodb2no, hard_decisions
-from sionna.phy.channel.tr38901 import UMa, PanelArray
-from sionna.phy.channel import OFDMChannel, gen_single_sector_topology
-from sionna.sys import phy_abstraction
-from sionna.sys import scheduling
+
+from .config import RadioConfig
+from .mimo_3d import AircraftState, MIMO3DChannel
+from .signal_postprocessing import SignalPostProcessor, TrackEstimate
+
+
+class SensingPoint(Protocol):
+    timestamp: datetime
+    x: float
+    y: float
+    z: float
+    speed: float
+
+
+@dataclass(frozen=True)
+class GNodeBStatus:
+    """Observable endpoint counters useful for monitoring and tests."""
+
+    processed_frames: int
+    last_timestamp: datetime | None
+    last_range_m: float | None
+    last_speed_mps: float | None
+
+
+@dataclass(frozen=True)
+class SensingFrame:
+    """Optional raw-frame container for diagnostics and offline replay."""
+
+    channel: np.ndarray
+    received: np.ndarray
+    track: TrackEstimate
+
 
 class gNodeB:
-    carrier_frequency : float
-    bandwidth : float
-    subcarrier_spacing : float
-    num_tx_ant : int
-    unm_rx_ant : int 
-    max_num_streams: int
-    cell_id : int
+    """Generate pilots, sense a target, and reconstruct its trajectory."""
 
     def __init__(
-            self,
-            carrier_frequency: float = 3.5e9,
-            bandwitdh: float = 20e6,
-            subcarrier_spacing: float = 30e3,
-            num_tx_ant: int = 8,
-            unm_rx_ant: int = 2,
-            max_num_streams: int = 2,
-            cell_id: int = 0,
-    ):
-        config.phy_precision = "complex64"
-        self.carrier_frequency = carrier_frequency
-        self.bandwidth = bandwitdh
-        self.subcarrier_spacing = subcarrier_spacing
-        self.num_tx_ant = num_tx_ant
-        self.num_rx_ant = num_tx_ant
-        self.max_num_streams = max_num_streams
-        self.cell_id = cell_id
-        n_rb = int(np.floor(bandwitdh / subcarrier_spacing / 12))
-        self.num_subcarriers = n_rb * 12
-        self.num_ofdm_symbols = 14
-        self.cp_lemgth = int(np.ceil(0.07 * (1 / subcarrier_spacing) * self._fft_size()))
-        self._build_phy_pipeline()
+        self,
+        config: RadioConfig | None = None,
+        seed: int | None = 7,
+        noise_power: float = 1e-3,
+        node_id: str = "gnodeb-0",
+    ) -> None:
+        if noise_power < 0:
+            raise ValueError("noise_power must be non-negative")
+        self.config = config or RadioConfig()
+        self.node_id = node_id
+        self.noise_power = float(noise_power)
+        self.channel = MIMO3DChannel(self.config, seed=seed)
+        self.postprocessor = SignalPostProcessor(self.config)
+        self._processed_frames = 0
+        self._last_track: TrackEstimate | None = None
+        self._relay: Callable[[dict[str, Any]], None] | None = None
+        self._history: list[TrackEstimate] = []
 
-        def _fft_size(self) -> int:
-            n = self.num_subcarriers
-            return 1 << (n - 1).bit_length()
-
-        def _build_phy_pipeline(self):
-            self.resource_grid = ResourceGrid(num_ofdm_symbols=self.num_ofdm_symbols, fft_size=self._fft_size(), 
-                subcarrier_spacing=self.subcarrier_spacing,
-                num_tx=self.num_tx_ant,
-                num_streams_per_tx=self.max_num_streams,
-                cyclic_prefix_length=self.cp_length,
-                num_guarg_carriers = (int(self.num_subcarriers * 0.05), 0),
-                pilot_pattern="kronecker",
-                pilot_ofdm_symbol_indices=[2, 11])
-            
-            
-            self.stream_management = StreamManagement(
-                num_streams_per_tx=self.max_num_streams,
-                num_tx=self.num_tx_ant,
-                num_rx=1,
-                )
-            self.num_bits_per_symbol = 4           # 16-QAM
-            self.coderate = 0.5
-            n = int(np.prod(self.resource_grid.num_data_symbols) *
-                    self.num_bits_per_symbol)
-            k = int(self.coderate * n)
-            self.encoder = LDPC5GEncoder(k=k, n=n)
-            self.decoder = LDPC5GDecoder(self.encoder, hard_out=True)
-
-            self.mapper = Mapper("qam", self.num_bits_per_symbol)
-            self.demapper = Demapper("app", "qam", self.num_bits_per_symbol)
-            self.qam_source = QAMSource(self.num_bits_per_symbol)
-
-        def _build_sys_pipeline(self):
-            self.effective_sinr = phy_abstraction.EffectiveSINR(
-            num_bits_per_symbol=self.num_bits_per_symbol,
-            coderate=self.coderate,
+    @property
+    def status(self) -> GNodeBStatus:
+        track = self._last_track
+        return GNodeBStatus(
+            processed_frames=self._processed_frames,
+            last_timestamp=track.timestamp if track else None,
+            last_range_m=track.range_m if track else None,
+            last_speed_mps=track.speed if track else None,
         )
-            self.scheduler = scheduling.ProportionalFairScheduler()
 
-        def schedule(self, ue_metrics: dict) -> dict:
-            priority = self.scheduler.compute_priority(ue_metrics)
-            ue_id = int(np.argmax(priority))
-            mcs = self._select_mcs(ue_metrics["cqi"][ue_id])
-            return {"ue_id": ue_id, "mcs": mcs, "priority": priority}
+    def configure_noise(self, noise_power: float) -> None:
+        """Update receiver noise for subsequent frames."""
+        if noise_power < 0:
+            raise ValueError("noise_power must be non-negative")
+        self.noise_power = float(noise_power)
 
-        def _select_mcs(self, cqi: float) -> int:
-            return int(phy_abstraction.cqi_to_mcs(cqi))
+    def set_relay(self, relay: Callable[[dict[str, Any]], None] | None) -> None:
+        """Register a downstream callback for reconstructed track payloads."""
+        self._relay = relay
 
-        def _mcs_to_modulation(self, mcs: int):
-            return phy_abstraction.mcs_to_modulation(mcs)
-
-        # DL(Downlink)
-        def transmit(self, num_bits: int):
-            bits = tf.random.uniform(
-            [1, num_bits], minval=0, maxval=2, dtype=tf.int32)
-            coded = self.encoder(bits)
-            x = self.mapper(coded)
-            x_rg = self.rg_mapper(x)
-            x_ofdm = self.ofdm_mod(x_rg)
-            return x_ofdm, x_rg, bits
-        
-        # UL(Uplink)
-        def receive(self, y_ofdm: tf.Tensor, num_bits: int):
-            y_rg = self.ofdm_demod(y_ofdm)
-            h_hat, err_var = self.channel_estimator(y_rg, self.no)
-            x_hat, no_eff = self.equalizer(y_rg, h_hat, err_var, self.no)
-            llr = self.demapper(x_hat, no_eff)
-            bits_hat = self.decoder(llr[:, :num_bits])
-            return bits_hat
-
-        def build_chanel(self, ut_loc=None, bs_loc=None, num_ut: int = 1):
-            bs_array = PanelArray(
-            num_rows_per_panel=1,
-            num_cols_per_panel=self.num_tx_ant,
-            polarization="dual",
-            polarization_type="VH",
+    def reference_signals(self) -> np.ndarray:
+        """Return deterministic pilots with OFDM-compatible dimensions."""
+        return np.ones(
+            (
+                self.config.num_ofdm_symbols,
+                self.config.num_tx_antennas,
+                self.config.fft_size,
+            ),
+            dtype=np.complex128,
         )
-            ut_array = PanelArray(
-            num_rows_per_panel=1,
-            num_cols_per_panel=self.num_rx_ant,
-            polarization="single",
-            polarization_type="V",
-        )
-            topology = gen_single_sector_topology(
-            batch_size=1,
-            num_ut=num_ut,
-            scenario="uma",
-            min_ut_velocity=3.0,
-            max_ut_velocity=30.0,
-        )
-            channel_model = UMa(
-            carrier_frequency=self.carrier_frequency,
-            o2i_model="low",
-            ut_array=ut_array,
-            bs_array=bs_array,
-            direction="downlink",
-            enable_pathloss=True,
-            enable_shadow_fading=True,
-        )
-            channel = OFDMChannel(
-            channel_model=channel_model,
-            resource_grid=self.resource_grid,
-            add_neutral_symbols=False,
-        )
-            return channel, topology
 
-        #SINR
-        def set_noise_from_snr(self, snr_db: float, coderate: float = None):
-            coderate = coderate if coderate is not None else self.coderate
-            self.no = ebnodb2no(
-                ebno_db=snr_db - 10 * np.log10(self.num_bits_per_symbol),
-                num_bits_per_symbol=self.num_bits_per_symbol,
-                coderate=coderate,
-                )
-            return self.no
-        
-        def estimate_sinr(self, h_eff: tf.Tensor, no: tf.Tensor) -> tf.Tensor:
-            return self.effective_sinr(h_eff, no)
+    def pilot_mask(self) -> np.ndarray:
+        """Return the active subcarrier mask used by the pilot grid."""
+        return np.ones(self.config.fft_size, dtype=bool)
+
+    @staticmethod
+    def _validate_point(point: SensingPoint) -> None:
+        for name in ("x", "y", "z", "speed"):
+            value = float(getattr(point, name))
+            if not np.isfinite(value):
+                raise ValueError(f"trajectory point field {name!r} must be finite")
+        if point.timestamp.tzinfo is None:
+            raise ValueError("trajectory timestamp must be timezone-aware")
+
+    def _state_from_point(self, point: SensingPoint) -> AircraftState:
+        self._validate_point(point)
+        return AircraftState(
+            position=(float(point.x), float(point.y), float(point.z)),
+            velocity=(float(point.speed), 0.0, 0.0),
+        )
+
+    def sense_state(self, state: AircraftState) -> tuple[np.ndarray, np.ndarray]:
+        """Generate a channel tensor and received signal for a 3D state."""
+        return self.channel.generate(
+            state,
+            num_symbols=self.config.num_ofdm_symbols,
+            noise_power=self.noise_power,
+        )
+
+    def sense(self, point: SensingPoint) -> tuple[np.ndarray, np.ndarray]:
+        return self.sense_state(self._state_from_point(point))
+
+    def process(self, point: SensingPoint) -> TrackEstimate:
+        """Process one point and update endpoint state."""
+        channel, received = self.sense(point)
+        track = self.postprocessor.reconstruct(
+            received,
+            point.timestamp.astimezone(timezone.utc),
+            antenna_positions=self.channel.rx_positions,
+            channel=channel,
+        )
+        self._processed_frames += 1
+        self._last_track = track
+        self._history.append(track)
+        if len(self._history) > 1024:
+            del self._history[:-1024]
+        if self._relay is not None:
+            self._relay(self.track_payload(track))
+        return track
+
+    def process_frame(self, point: SensingPoint) -> SensingFrame:
+        """Process one point while retaining the generated RF tensors."""
+        channel, received = self.sense(point)
+        track = self.postprocessor.reconstruct(
+            received,
+            point.timestamp.astimezone(timezone.utc),
+            antenna_positions=self.channel.rx_positions,
+            channel=channel,
+        )
+        self._processed_frames += 1
+        self._last_track = track
+        self._history.append(track)
+        if len(self._history) > 1024:
+            del self._history[:-1024]
+        if self._relay is not None:
+            self._relay(self.track_payload(track))
+        return SensingFrame(channel, received, track)
+
+    def history(self, limit: int | None = None) -> tuple[TrackEstimate, ...]:
+        """Return immutable recent estimates for a monitoring consumer."""
+        if limit is not None and limit < 0:
+            raise ValueError("limit must be non-negative")
+        values = self._history if limit is None else ([] if limit == 0 else self._history[-limit:])
+        return tuple(values)
+
+    def latest_payload(self) -> dict[str, Any]:
+        return self.track_payload()
+
+    def quality_metrics(self, track: TrackEstimate | None = None) -> dict[str, float]:
+        """Expose stable scalar quality indicators for relay monitoring."""
+        value = track or self._last_track
+        if value is None:
+            raise RuntimeError("no reconstructed track is available")
+        return {
+            "range_m": float(value.range_m),
+            "speed_mps": float(value.speed),
+            "accuracy_m": float(value.accuracy_m),
+            "azimuth_rad": float(value.azimuth_rad),
+            "elevation_rad": float(value.elevation_rad),
+        }
+
+    def is_ready(self) -> bool:
+        return self._last_track is not None
+
+    def antenna_positions(self) -> dict[str, np.ndarray]:
+        """Return copies so monitoring code cannot mutate channel geometry."""
+        return {
+            "tx": np.array(self.channel.tx_positions, copy=True),
+            "rx": np.array(self.channel.rx_positions, copy=True),
+        }
+
+    def validate(self) -> None:
+        """Raise if the endpoint configuration is not simulation-safe."""
+        if self.config.num_tx_antennas < 1 or self.config.num_rx_antennas < 1:
+            raise ValueError("gNodeB requires at least one TX and RX antenna")
+        if self.config.fft_size < 2 or self.config.num_ofdm_symbols < 2:
+            raise ValueError("OFDM grid must contain at least two bins and symbols")
+
+    def close(self) -> None:
+        """Detach relay callbacks and release accumulated estimate history."""
+        self._relay = None
+        self._history.clear()
+
+    def process_batch(self, points: Iterable[SensingPoint]) -> list[TrackEstimate]:
+        return [self.process(point) for point in points]
+
+    def track_payload(self, track: TrackEstimate | None = None) -> dict[str, Any]:
+        """Create a JSON/ASTERIX-ready payload from the latest estimate."""
+        value = track or self._last_track
+        if value is None:
+            raise RuntimeError("no reconstructed track is available")
+        return {
+            "node_id": self.node_id,
+            "timestamp": value.timestamp.astimezone(timezone.utc).timestamp(),
+            "x": float(value.x),
+            "y": float(value.y),
+            "speed": float(value.speed),
+            "range_m": float(value.range_m),
+            "azimuth_rad": float(value.azimuth_rad),
+            "elevation_rad": float(value.elevation_rad),
+            "accuracy": float(value.accuracy_m),
+        }
+
+    def channel_shapes(self) -> dict[str, tuple[int, ...]]:
+        """Expose channel dimensions without allocating a simulation frame."""
+        return {
+            "rx_positions": tuple(self.channel.rx_positions.shape),
+            "tx_positions": tuple(self.channel.tx_positions.shape),
+        }
+
+    def reset(self) -> None:
+        """Reset DSP history and endpoint counters."""
+        self.postprocessor = SignalPostProcessor(self.config)
+        self._processed_frames = 0
+        self._last_track = None
+        self._history.clear()

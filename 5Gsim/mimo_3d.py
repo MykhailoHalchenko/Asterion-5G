@@ -111,7 +111,10 @@ class MIMO3DChannel:
         delta = target
         radial_velocity = float(np.dot(delta, np.asarray(state.velocity)) / distance)
         wavelength = LIGHT_SPEED / self.config.carrier_frequency
-        time_phase = np.exp(1j * 2 * np.pi * radial_velocity * np.arange(symbols) / wavelength)
+        doppler_hz = 2.0 * radial_velocity / wavelength
+        time_phase = np.exp(
+            1j * 2 * np.pi * doppler_hz * np.arange(symbols) * self.config.symbol_duration
+        )
         frequency_phase = np.exp(
             -1j * 2 * np.pi * np.arange(self.config.fft_size)
             * distance / LIGHT_SPEED * self.config.subcarrier_spacing

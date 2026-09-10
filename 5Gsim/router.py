@@ -43,3 +43,23 @@ class TrackRouter:
 
     def to_json(self, track: TrackEstimate, unix_timestamp: float | None = None) -> str:
         return json.dumps(self.format_track(track, unix_timestamp), separators=(",", ":"))
+
+
+class RelayRouter(TrackRouter):
+    """Relay 5G track payloads to a downstream ASTERIX packaging stage."""
+
+    def __init__(self, maxsize: int = 0) -> None:
+        super().__init__(maxsize=maxsize)
+        self._relay_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=maxsize)
+
+    def relay(self, track: TrackEstimate, unix_timestamp: float | None = None) -> dict[str, Any]:
+        payload = self.format_track(track, unix_timestamp)
+        payload["source"] = "5g-rf-sensing"
+        self._relay_queue.put(payload, block=True)
+        return payload
+
+    def receive_relay(self, timeout: float | None = None) -> dict[str, Any]:
+        return self._relay_queue.get(block=True, timeout=timeout)
+
+    def relay_json(self, track: TrackEstimate, unix_timestamp: float | None = None) -> str:
+        return json.dumps(self.relay(track, unix_timestamp), separators=(",", ":"))
