@@ -1,4 +1,4 @@
-"""Geometry-aware stochastic 3D MIMO channel (without ray tracing)."""
+"""Sionna PHY-based stochastic 3D MIMO channel (without ray tracing)."""
 
 from __future__ import annotations
 
@@ -19,24 +19,72 @@ class AircraftState:
     velocity: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
 
-def _upa(rows: int, cols: int, spacing: float) -> np.ndarray:
-    y, z = np.meshgrid(
-        (np.arange(cols) - (cols - 1) / 2.0) * spacing,
-        (np.arange(rows) - (rows - 1) / 2.0) * spacing,
-    )
-    return np.column_stack((np.zeros(rows * cols), y.ravel(), z.ravel()))
-
-
 class MIMO3DChannel:
-    """Generate a specular aircraft cluster plus diffuse spatial paths."""
+    """Generate aircraft channels with Sionna's 3GPP CDL model."""
 
     def __init__(self, config: RadioConfig | None = None, seed: int | None = 7):
         self.config = config or RadioConfig()
-        self.rng = np.random.default_rng(seed)
-        wavelength = LIGHT_SPEED / self.config.carrier_frequency
-        self.tx_positions = _upa(self.config.tx_rows, self.config.tx_cols, wavelength / 2)
-        self.rx_positions = _upa(self.config.rx_rows, self.config.rx_cols, wavelength / 2)
-        self._sionna_arrays: tuple[Any, Any] | None = None
+        try:
+            import torch
+            from sionna.phy.channel import AWGN
+            from sionna.phy.channel import cir_to_ofdm_channel
+            from sionna.phy.channel.tr38901 import CDL, PanelArray
+            from sionna.phy.ofdm import ResourceGrid
+        except ImportError as exc:
+            raise RuntimeError(
+                "Sionna PHY and its Torch backend are required for the channel"
+            ) from exc
+
+        if seed is not None:
+            torch.manual_seed(seed)
+        self._torch = torch
+        self._cir_to_ofdm_channel = cir_to_ofdm_channel
+        self._awgn = AWGN()
+        self._sionna_arrays = (
+            PanelArray(
+                self.config.tx_rows,
+                self.config.tx_cols,
+                polarization="single",
+                polarization_type="V",
+                antenna_pattern="omni",
+                carrier_frequency=self.config.carrier_frequency,
+            ),
+            PanelArray(
+                self.config.rx_rows,
+                self.config.rx_cols,
+                polarization="single",
+                polarization_type="V",
+                antenna_pattern="omni",
+                carrier_frequency=self.config.carrier_frequency,
+            ),
+        )
+        self.tx_positions = self._sionna_arrays[0].ant_pos.detach().cpu().numpy()
+        self.rx_positions = self._sionna_arrays[1].ant_pos.detach().cpu().numpy()
+        self.resource_grid = ResourceGrid(
+            num_ofdm_symbols=self.config.num_ofdm_symbols,
+            fft_size=self.config.fft_size,
+            subcarrier_spacing=self.config.subcarrier_spacing,
+            num_tx=self.config.num_tx_antennas,
+            num_streams_per_tx=1,
+            precision="single",
+        )
+        self._frequencies = torch.fft.fftshift(
+            torch.fft.fftfreq(
+                self.config.fft_size,
+                d=1.0 / self.config.bandwidth,
+                dtype=torch.float32,
+            )
+        )
+        self._channel_model = CDL(
+            model="C",
+            delay_spread=100e-9,
+            carrier_frequency=self.config.carrier_frequency,
+            ut_array=self._sionna_arrays[1],
+            bs_array=self._sionna_arrays[0],
+            direction="downlink",
+            ut_velocity=torch.zeros(3, dtype=torch.float32),
+            precision="single",
+        )
 
     @property
     def num_tx(self) -> int:
@@ -47,83 +95,79 @@ class MIMO3DChannel:
         return self.config.num_rx_antennas
 
     def sionna_arrays(self) -> tuple[Any, Any]:
-        if self._sionna_arrays is None:
-            try:
-                from sionna.phy.channel.tr38901 import PanelArray
-            except ImportError as exc:
-                raise RuntimeError("Sionna PHY is required for antenna arrays") from exc
-            kwargs = {
-                "polarization": "single",
-                "polarization_type": "V",
-                "antenna_pattern": "omni",
-                "carrier_frequency": self.config.carrier_frequency,
-            }
-            self._sionna_arrays = (
-                PanelArray(self.config.tx_rows, self.config.tx_cols, **kwargs),
-                PanelArray(self.config.rx_rows, self.config.rx_cols, **kwargs),
-            )
         return self._sionna_arrays
 
     def spatial_covariance(self, angle: float, spread: float = 0.12) -> np.ndarray:
-        wavelength = LIGHT_SPEED / self.config.carrier_frequency
-        steering = np.exp(1j * 2 * np.pi * self.rx_positions[:, 1] * np.sin(angle) / wavelength)
+        steering = np.exp(
+            1j
+            * 2
+            * np.pi
+            * self.rx_positions[:, 1]
+            * np.sin(angle)
+            / (LIGHT_SPEED / self.config.carrier_frequency)
+        )
         covariance = np.outer(steering, steering.conj()) + spread * np.eye(self.num_rx)
         return covariance / np.trace(covariance).real * self.num_rx
-
-    def _steering(self, positions: np.ndarray, azimuth: float, elevation: float) -> np.ndarray:
-        wavelength = LIGHT_SPEED / self.config.carrier_frequency
-        direction = np.array([
-            np.cos(elevation) * np.cos(azimuth),
-            np.cos(elevation) * np.sin(azimuth),
-            np.sin(elevation),
-        ])
-        return np.exp(1j * 2 * np.pi * positions @ direction / wavelength)
 
     def generate(
         self,
         state: AircraftState,
         num_symbols: int | None = None,
         noise_power: float = 1e-3,
-        diffuse_paths: int = 4,
     ) -> tuple[np.ndarray, np.ndarray]:
-        if noise_power < 0 or diffuse_paths < 0:
-            raise ValueError("noise_power and diffuse_paths must be non-negative")
+        if noise_power < 0:
+            raise ValueError("noise_power must be non-negative")
         symbols = num_symbols or self.config.num_ofdm_symbols
         target = np.asarray(state.position, dtype=float)
         distance = float(np.linalg.norm(target))
         if distance <= 0:
             raise ValueError("aircraft position must differ from the base station")
-        azimuth = float(np.arctan2(target[1], target[0]))
-        elevation = float(np.arctan2(target[2], np.linalg.norm(target[:2])))
-        tx = self._steering(self.tx_positions, azimuth, elevation)
-        rx = self._steering(self.rx_positions, azimuth, elevation)
-        channel = np.outer(rx, tx.conj()) / distance
-        channel *= np.exp(1j * self.rng.uniform(-np.pi, np.pi))
-        for _ in range(diffuse_paths):
-            path_azimuth = azimuth + self.rng.normal(0.0, 0.04)
-            path_elevation = elevation + self.rng.normal(0.0, 0.02)
-            diffuse_tx = self._steering(self.tx_positions, path_azimuth, path_elevation)
-            diffuse_rx = self._steering(self.rx_positions, path_azimuth, path_elevation)
-            coefficient = (
-                self.rng.normal() + 1j * self.rng.normal()
-            ) * 0.08 / max(distance, 1.0)
-            channel += coefficient * np.outer(diffuse_rx, diffuse_tx.conj())
-        delta = target
-        radial_velocity = float(np.dot(delta, np.asarray(state.velocity)) / distance)
-        wavelength = LIGHT_SPEED / self.config.carrier_frequency
-        doppler_hz = 2.0 * radial_velocity / wavelength
-        time_phase = np.exp(
-            1j * 2 * np.pi * doppler_hz * np.arange(symbols) * self.config.symbol_duration
+        torch = self._torch
+        radial_velocity = float(np.dot(target, np.asarray(state.velocity)) / distance)
+
+        path_gain, path_delay = self._channel_model(
+            1,
+            symbols,
+            self.config.bandwidth,
         )
-        frequency_phase = np.exp(
-            -1j * 2 * np.pi * np.arange(self.config.fft_size)
-            * distance / LIGHT_SPEED * self.config.subcarrier_spacing
+        path_delay = path_delay + distance / LIGHT_SPEED
+        channel = self._cir_to_ofdm_channel(
+            self._frequencies.to(path_gain.device),
+            path_gain,
+            path_delay,
+            normalize=False,
         )
-        h = time_phase[:, None, None, None] * channel[None, :, :, None] * frequency_phase
-        pilots = np.ones((symbols, self.num_tx, self.config.fft_size), dtype=np.complex128)
-        y = np.einsum("srtf,stf->srf", h, pilots)
-        if noise_power:
-            y += np.sqrt(noise_power / 2) * (
-                self.rng.normal(size=y.shape) + 1j * self.rng.normal(size=y.shape)
+        channel = channel[0, 0, :, 0, :, :, :].permute(2, 0, 1, 3)
+
+        doppler_hz = 2.0 * radial_velocity / (
+            LIGHT_SPEED / self.config.carrier_frequency
+        )
+        doppler = torch.exp(
+            1j
+            * 2
+            * torch.pi
+            * doppler_hz
+            * torch.arange(
+                symbols,
+                dtype=torch.float32,
+                device=channel.device,
             )
-        return h, y
+            * self.config.symbol_duration
+        )
+        channel = channel * doppler[:, None, None, None]
+        pilots = torch.ones(
+            (symbols, self.num_tx, self.config.fft_size),
+            dtype=channel.dtype,
+            device=channel.device,
+        )
+        received = torch.einsum("srtf,stf->srf", channel, pilots)
+        if noise_power:
+            received = self._awgn(
+                received,
+                torch.as_tensor(
+                    noise_power,
+                    dtype=torch.float32,
+                    device=received.device,
+                ),
+            )
+        return channel.detach().cpu().numpy(), received.detach().cpu().numpy()
