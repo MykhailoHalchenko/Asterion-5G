@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+.pytest_cache/
+cache/
+*.py[cod]
+*$py.class
+
+# Local editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Regenerable pipeline outputs
+blind_spots_for_simulation.csv
+simulation_points.csv
+ground_tracks.csv
+taxi_pair_profiles.csv
+fused_dataset.parquet

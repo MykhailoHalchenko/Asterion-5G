@@ -1,0 +1,5 @@
+pandas>=2.0
+pyarrow>=14.0
+osmnx>=2.0
+ast-tool-py>=0.27
+pytest>=8.0
