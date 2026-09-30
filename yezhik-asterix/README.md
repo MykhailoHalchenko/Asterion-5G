@@ -23,7 +23,6 @@ find_blind_spots.py                 Пошук часових розривів �
 generate_simulation_points.py       Генерація проміжних координат
 taxiway_tracks.py                   OSM taxiway routing і синтетичні наземні треки
 run_pipeline.py                     CLI для повного пайплайна
-run.ps1                             Запуск пайплайна у Windows PowerShell
 test_pipeline.py                    Автоматичні тести
 test_taxiway_tracks.py              Тести OSM-маршрутів і CAT 062
 requirements.txt                    Python-залежності
@@ -60,14 +59,8 @@ python -m pip install -r requirements.txt
 
 Запуск стандартної конфігурації:
 
-```powershell
-.\run.ps1
-```
-
-Або без PowerShell-обгортки:
-
-```powershell
-python run_pipeline.py `
+```bash
+python run_pipeline.py \
   --input training_2025-01-01_2025-02-01.parquet `
   --threshold 1 `
   --interval 300 `
@@ -93,8 +86,8 @@ python run_pipeline.py `
 
 OSM-режим для Frankfurt Airport:
 
-```powershell
-python run_pipeline.py `
+```bash
+python run_pipeline.py \
   --input training_2025-01-01_2025-02-01.parquet `
   --ground-tracks `
   --airport-icao EDDF `

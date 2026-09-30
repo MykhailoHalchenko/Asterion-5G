@@ -66,7 +66,7 @@ def merge_and_export(original_parquet_path, simulated_csv_path, output_parquet_p
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fused.to_parquet(output_path, index=False)
 
-    print(f"Датасет успішно зшито. Збережено у {output_path}")
+    print(f"Dataset successfully fused. Saved to {output_path}")
     return fused
 
 

@@ -98,7 +98,7 @@ def find_gaps_in_tracks(input_parquet_path, gap_threshold_seconds=5.0, output_cs
     output_path.parent.mkdir(parents=True, exist_ok=True)
     final_blind_spots.to_csv(output_path, index=False)
 
-    print(f"Знайдено {len(final_blind_spots)} сліпих зон. Експортовано в CSV: {output_path}")
+    print(f"Found {len(final_blind_spots)} blind spots. Exported to CSV: {output_path}")
     return final_blind_spots
 
 

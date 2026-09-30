@@ -81,7 +81,7 @@ def generate_simulation_points(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(output_path, index=False)
 
-    print(f"Згенеровано {len(result)} симуляційних точок. Збережено в CSV: {output_path}")
+    print(f"Generated {len(result)} simulation points. Saved to CSV: {output_path}")
     return result
 
 

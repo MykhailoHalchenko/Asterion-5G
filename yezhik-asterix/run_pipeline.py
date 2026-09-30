@@ -38,7 +38,7 @@ def main():
         airport_movements = movements[local_airport.eq(airport)]
         profiles = build_pair_profiles(airport_movements)
         profiles.to_csv(args.pair_profiles_output, index=False)
-        print(f"Профілі stand-runway збережено: {args.pair_profiles_output}")
+        print(f"Stand-runway profiles saved to: {args.pair_profiles_output}")
 
         simulation = generate_ground_tracks(
             args.input,
@@ -62,7 +62,7 @@ def main():
     )
 
     if blind.empty:
-        print("Великих запинок не знайдено. Створюю порожній симуляційний датасет.")
+        print("No large gaps found. Creating an empty simulation dataset.")
         simulation = []
     else:
         simulation = generate_simulation_points(
@@ -89,7 +89,7 @@ def main():
         empty["source"] = "opensky"
         empty["cat062_hex"] = ""
         empty.to_parquet(args.fused_output, index=False)
-        print(f"Збережено порожній fused датасет: {args.fused_output}")
+        print(f"Empty fused dataset saved to: {args.fused_output}")
 
 
 if __name__ == "__main__":

@@ -340,7 +340,7 @@ def generate_ground_tracks(
             except (ValueError, KeyError) as exc:
                 route_failures[route_key] = str(exc)
                 skipped += 1
-                print(f"Пропущено {route_key}: {exc}")
+                print(f"Skipped {route_key}: {exc}")
                 continue
         route = route_cache[route_key]
 
@@ -384,5 +384,5 @@ def generate_ground_tracks(
     output_path = Path(output_csv_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(output_path, index=False)
-    print(f"Створено {len(result)} точок OSM-треків; пропущено рухів: {skipped}.")
+    print(f"Created {len(result)} OSM track points; skipped movements: {skipped}.")
     return result

@@ -12,7 +12,6 @@ rf_sensing = import_module("5Gsim.rf_sensing")
 router = import_module("5Gsim.router")
 RFSensingSimulator = rf_sensing.RFSensingSimulator
 TrajectoryPoint = rf_sensing.TrajectoryPoint
-to_asterix_records = rf_sensing.to_asterix_records
 RelayRouter = router.RelayRouter
 map_modelling = import_module("5Gsim.map_modelling")
 plot_signals = map_modelling.plot_signals
@@ -22,10 +21,10 @@ def main() -> None:
     """Run continuously until the operator presses Ctrl+C."""
 
     simulator = RFSensingSimulator(seed=7, noise_power=1e-4)
-    router = RelayRouter()
+    relay_router = RelayRouter()
     tracks = []
     sample_index = 0
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     logs_dir = root / "output-logs"
     graphs_dir = root / "graphs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -39,6 +38,7 @@ def main() -> None:
     try:
         import drjit as dr
         import matplotlib.pyplot as plt
+
         plt.ion()
         signal_figure = None
         while True:
@@ -52,8 +52,8 @@ def main() -> None:
                 speed=10.0,
             )
             track = simulator.process(point)
-            routed = router.relay(track)
-            router.receive_relay(timeout=1.0)
+            routed = relay_router.relay(track)
+            relay_router.receive_relay(timeout=1.0)
             tracks.append(track)
             tracks = tracks[-100:]
             signal_figure = plot_signals(
@@ -62,7 +62,6 @@ def main() -> None:
                 output_path=graph_path,
             )
             plt.show(block=False)
-            # Keep a device-compatible Dr.Jit scalar in the simulation loop.
             dr_metric = dr.square(dr.scalar.Float(track.speed))
             dr.eval(dr_metric)
             record = {
